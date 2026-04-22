@@ -6,6 +6,8 @@ import json
 import os
 import re
 import sys
+import uuid
+import zipfile
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
@@ -181,6 +183,105 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   </main>
 </body>
 </html>
+"""
+
+EPUB_STYLES = """body {
+  margin: 0;
+  padding: 0 0.5em 1.2em;
+  color: #1e1a16;
+  font-family: serif;
+  line-height: 1.7;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  text-align: center;
+  line-height: 1.3;
+  margin: 0.8em 0;
+}
+
+h1 {
+  font-size: 1.5em;
+}
+
+.paragraph,
+.list-block {
+  margin: 0 0 1.1em;
+}
+
+.sentence {
+  margin: 0 0 0.7em;
+  padding-bottom: 0.45em;
+  border-bottom: 1px solid #ddd2c2;
+}
+
+.sentence:last-child {
+  border-bottom: 0;
+}
+
+.hanzi-line,
+.english-line {
+  margin: 0;
+}
+
+.hanzi-line {
+  font-size: 1.05em;
+}
+
+.english-line {
+  margin-top: 0.2em;
+  color: #2a4b6b;
+  font-size: 0.9em;
+  font-style: italic;
+}
+
+ruby.hz rt {
+  font-size: 0.55em;
+  color: #6d6256;
+}
+
+li {
+  margin-bottom: 0.7em;
+}
+"""
+
+EPUB_CHAPTER_TEMPLATE = """<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="zh-Hans">
+  <head>
+    <title>{title}</title>
+    <meta charset="utf-8" />
+    <link rel="stylesheet" type="text/css" href="styles/book.css" />
+  </head>
+  <body>
+    {body}
+  </body>
+</html>
+"""
+
+EPUB_NAV_TEMPLATE = """<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" lang="en">
+  <head>
+    <title>Table of Contents</title>
+    <meta charset="utf-8" />
+  </head>
+  <body>
+    <nav epub:type="toc" id="toc">
+      <h1>Contents</h1>
+      <ol>
+        <li><a href="chapter.xhtml">{title}</a></li>
+      </ol>
+    </nav>
+  </body>
+</html>
+"""
+
+EPUB_CONTAINER_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>
 """
 
 
@@ -486,6 +587,56 @@ def render_document(markdown_text: str, translator: SentenceTranslator, cache: T
     return title, "\n".join(part for part in body_parts if part)
 
 
+def render_html_page(title: str, body: str) -> str:
+    return PAGE_TEMPLATE.format(title=html.escape(title), body=body)
+
+
+def build_epub_opf(title: str, identifier: str) -> str:
+    escaped_title = html.escape(title)
+    escaped_identifier = html.escape(identifier)
+    return f"""<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="bookid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:identifier id="bookid">{escaped_identifier}</dc:identifier>
+    <dc:title>{escaped_title}</dc:title>
+    <dc:language>zh-CN</dc:language>
+    <meta property="dcterms:modified">2026-04-21T00:00:00Z</meta>
+  </metadata>
+  <manifest>
+    <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
+    <item id="chapter" href="chapter.xhtml" media-type="application/xhtml+xml"/>
+    <item id="css" href="styles/book.css" media-type="text/css"/>
+  </manifest>
+  <spine>
+    <itemref idref="chapter"/>
+  </spine>
+</package>
+"""
+
+
+def write_epub(output_path: Path, title: str, body: str) -> None:
+    identifier = f"urn:uuid:{uuid.uuid5(uuid.NAMESPACE_URL, title)}"
+    chapter_xhtml = EPUB_CHAPTER_TEMPLATE.format(
+        title=html.escape(title),
+        body=body,
+    )
+    nav_xhtml = EPUB_NAV_TEMPLATE.format(title=html.escape(title))
+    content_opf = build_epub_opf(title, identifier)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(output_path, "w") as epub:
+        epub.writestr(
+            zipfile.ZipInfo("mimetype"),
+            "application/epub+zip",
+            compress_type=zipfile.ZIP_STORED,
+        )
+        epub.writestr("META-INF/container.xml", EPUB_CONTAINER_XML)
+        epub.writestr("OEBPS/content.opf", content_opf)
+        epub.writestr("OEBPS/nav.xhtml", nav_xhtml)
+        epub.writestr("OEBPS/chapter.xhtml", chapter_xhtml)
+        epub.writestr("OEBPS/styles/book.css", EPUB_STYLES)
+
+
 def ensure_translation_package() -> None:
     import argostranslate.package
     import argostranslate.translate
@@ -525,9 +676,21 @@ def run_render(input_path: Path, output_path: Path) -> None:
     translator = SentenceTranslator()
     markdown_text = input_path.read_text(encoding="utf-8")
     title, body = render_document(markdown_text, translator, cache)
-    output_html = PAGE_TEMPLATE.format(title=html.escape(title), body=body)
+    output_html = render_html_page(title, body)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(output_html, encoding="utf-8")
+    cache.save()
+    print(f"Rendered {input_path} -> {output_path}")
+
+
+def run_render_epub(input_path: Path, output_path: Path) -> None:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    cache = TranslationCache(TRANSLATION_CACHE_PATH)
+    translator = SentenceTranslator()
+    markdown_text = input_path.read_text(encoding="utf-8")
+    title, body = render_document(markdown_text, translator, cache)
+    write_epub(output_path, title, body)
     cache.save()
     print(f"Rendered {input_path} -> {output_path}")
 
@@ -555,6 +718,20 @@ def build_parser() -> argparse.ArgumentParser:
             args.input,
             args.output
             or OUTPUT_DIR / f"{args.input.stem}.html",
+        )
+    )
+
+    epub_parser = subparsers.add_parser(
+        "render-epub",
+        help="Convert a markdown chapter into EPUB with pinyin and English translation.",
+    )
+    epub_parser.add_argument("input", type=Path, help="Path to the source markdown file.")
+    epub_parser.add_argument("output", type=Path, nargs="?", help="Target EPUB path.")
+    epub_parser.set_defaults(
+        func=lambda args: run_render_epub(
+            args.input,
+            args.output
+            or OUTPUT_DIR / f"{args.input.stem}.epub",
         )
     )
     return parser
