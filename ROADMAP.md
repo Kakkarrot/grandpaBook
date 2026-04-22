@@ -24,4 +24,6 @@ Convert Chinese markdown chapters into printable HTML where:
 - [x] Keep the project on a local Argos-based translation path.
 - [x] Download the Argos Chinese→English model into the repo cache.
 - [x] Render `chapters/Chapter_1.md` into printable HTML.
+- [x] Split long chapter renders into numbered sentence-safe chunks of about 5,000 text units.
+- [x] Organize generated outputs into separate `output/html/` and `output/epub/` folders.
 - [x] Review the output for pagination and translation quality.

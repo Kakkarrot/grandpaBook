@@ -17,6 +17,8 @@ ROOT = Path(__file__).resolve().parent
 CACHE_DIR = ROOT / ".cache"
 ARGOS_ROOT = CACHE_DIR / "argos"
 OUTPUT_DIR = ROOT / "output"
+HTML_OUTPUT_DIR = OUTPUT_DIR / "html"
+EPUB_OUTPUT_DIR = OUTPUT_DIR / "epub"
 TRANSLATION_CACHE_PATH = CACHE_DIR / "sentence_translations.json"
 
 # Keep all Argos data inside the repo so the project is self-contained.
@@ -43,6 +45,8 @@ HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
 TITLE_HINT_RE = re.compile(r"[。！？!?：:；;]")
 CLOSING_QUOTES = set("”’」』）》】」』）)]}")
 LIST_ITEM_RE = re.compile(r"^\s*([-*+]|\d+\.)\s+")
+TEXT_UNIT_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]|[A-Za-z0-9]+")
+DEFAULT_CHUNK_SIZE = 5000
 
 
 PAGE_TEMPLATE = """<!DOCTYPE html>
@@ -292,6 +296,12 @@ class Block:
     level: int = 0
 
 
+@dataclass
+class RenderChunk:
+    title: str
+    body: str
+
+
 class TranslationCache:
     def __init__(self, path: Path):
         self.path = path
@@ -488,6 +498,35 @@ def split_sentences(text: str) -> list[str]:
     return merged
 
 
+def estimate_text_units(text: str) -> int:
+    return len(TEXT_UNIT_RE.findall(text))
+
+
+def split_text_for_chunks(text: str, max_units: int) -> list[str]:
+    sentences = split_sentences(text)
+    if not sentences:
+        cleaned = text.strip()
+        return [cleaned] if cleaned else []
+
+    chunks: list[str] = []
+    current: list[str] = []
+    current_units = 0
+
+    for sentence in sentences:
+        sentence_units = max(estimate_text_units(sentence), 1)
+        if current and current_units + sentence_units > max_units:
+            chunks.append("".join(current).strip())
+            current = []
+            current_units = 0
+        current.append(sentence)
+        current_units += sentence_units
+
+    if current:
+        chunks.append("".join(current).strip())
+
+    return [chunk for chunk in chunks if chunk]
+
+
 def parse_blocks(markdown_text: str) -> list[Block]:
     lines = markdown_text.splitlines()
     blocks: list[Block] = []
@@ -532,6 +571,34 @@ def parse_blocks(markdown_text: str) -> list[Block]:
     return blocks
 
 
+def split_blocks_for_chunks(blocks: list[Block], max_units: int) -> list[list[Block]]:
+    expanded: list[tuple[Block, int]] = []
+    for block in blocks:
+        if block.kind == "paragraph":
+            for piece in split_text_for_chunks(block.text, max_units):
+                expanded.append((Block(kind="paragraph", text=piece, level=block.level), estimate_text_units(piece)))
+            continue
+        expanded.append((block, estimate_text_units(block.text)))
+
+    chunks: list[list[Block]] = []
+    current: list[Block] = []
+    current_units = 0
+
+    for block, block_units in expanded:
+        if current and block.kind != "heading" and current_units + block_units > max_units:
+            chunks.append(current)
+            current = []
+            current_units = 0
+        current.append(block)
+        if block.kind != "heading":
+            current_units += block_units
+
+    if current:
+        chunks.append(current)
+
+    return chunks
+
+
 def render_sentence(sentence: str, translator: SentenceTranslator, cache: TranslationCache) -> str:
     cached = cache.get(sentence)
     if cached is None:
@@ -572,19 +639,49 @@ def render_heading(block: Block) -> str:
     return f"<h{level}>{annotated}</h{level}>"
 
 
-def render_document(markdown_text: str, translator: SentenceTranslator, cache: TranslationCache) -> tuple[str, str]:
-    body_parts: list[str] = []
-    title = "Printable Chinese Reader"
-    for block in parse_blocks(markdown_text):
+def extract_title(blocks: list[Block]) -> str:
+    for block in blocks:
         if block.kind == "heading":
-            if title == "Printable Chinese Reader":
-                title = normalize_whitespace(block.text)
+            return normalize_whitespace(block.text)
+    return "Printable Chinese Reader"
+
+
+def render_blocks(blocks: list[Block], translator: SentenceTranslator, cache: TranslationCache) -> str:
+    body_parts: list[str] = []
+    for block in blocks:
+        if block.kind == "heading":
             body_parts.append(render_heading(block))
         elif block.kind == "list":
             body_parts.append(render_list(block, translator, cache))
         else:
             body_parts.append(render_paragraph(block, translator, cache))
-    return title, "\n".join(part for part in body_parts if part)
+    return "\n".join(part for part in body_parts if part)
+
+
+def render_document(markdown_text: str, translator: SentenceTranslator, cache: TranslationCache) -> tuple[str, str]:
+    blocks = parse_blocks(markdown_text)
+    title = extract_title(blocks)
+    body = render_blocks(blocks, translator, cache)
+    return title, body
+
+
+def render_document_chunks(
+    markdown_text: str,
+    translator: SentenceTranslator,
+    cache: TranslationCache,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+) -> list[RenderChunk]:
+    blocks = parse_blocks(markdown_text)
+    base_title = extract_title(blocks)
+    block_chunks = split_blocks_for_chunks(blocks, chunk_size)
+    total = len(block_chunks)
+    rendered_chunks: list[RenderChunk] = []
+
+    for index, chunk_blocks in enumerate(block_chunks, start=1):
+        chunk_title = base_title if total == 1 else f"{base_title} Part {index}"
+        rendered_chunks.append(RenderChunk(title=chunk_title, body=render_blocks(chunk_blocks, translator, cache)))
+
+    return rendered_chunks
 
 
 def render_html_page(title: str, body: str) -> str:
@@ -637,6 +734,15 @@ def write_epub(output_path: Path, title: str, body: str) -> None:
         epub.writestr("OEBPS/styles/book.css", EPUB_STYLES)
 
 
+def build_output_paths(output_path: Path, total_chunks: int) -> list[Path]:
+    if total_chunks == 1:
+        return [output_path]
+    return [
+        output_path.with_name(f"{output_path.stem}_{index}{output_path.suffix}")
+        for index in range(1, total_chunks + 1)
+    ]
+
+
 def ensure_translation_package() -> None:
     import argostranslate.package
     import argostranslate.translate
@@ -669,30 +775,36 @@ def run_setup_translate() -> None:
     print(f"Chinese→English translation package is ready in {ARGOS_ROOT}")
 
 
-def run_render(input_path: Path, output_path: Path) -> None:
+def run_render(input_path: Path, output_path: Path, chunk_size: int = DEFAULT_CHUNK_SIZE) -> None:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    HTML_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     cache = TranslationCache(TRANSLATION_CACHE_PATH)
     translator = SentenceTranslator()
     markdown_text = input_path.read_text(encoding="utf-8")
-    title, body = render_document(markdown_text, translator, cache)
-    output_html = render_html_page(title, body)
+    chunks = render_document_chunks(markdown_text, translator, cache, chunk_size)
+    output_paths = build_output_paths(output_path, len(chunks))
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(output_html, encoding="utf-8")
+    for chunk, chunk_output_path in zip(chunks, output_paths):
+        output_html = render_html_page(chunk.title, chunk.body)
+        chunk_output_path.write_text(output_html, encoding="utf-8")
     cache.save()
-    print(f"Rendered {input_path} -> {output_path}")
+    for chunk_output_path in output_paths:
+        print(f"Rendered {input_path} -> {chunk_output_path}")
 
 
-def run_render_epub(input_path: Path, output_path: Path) -> None:
+def run_render_epub(input_path: Path, output_path: Path, chunk_size: int = DEFAULT_CHUNK_SIZE) -> None:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    EPUB_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     cache = TranslationCache(TRANSLATION_CACHE_PATH)
     translator = SentenceTranslator()
     markdown_text = input_path.read_text(encoding="utf-8")
-    title, body = render_document(markdown_text, translator, cache)
-    write_epub(output_path, title, body)
+    chunks = render_document_chunks(markdown_text, translator, cache, chunk_size)
+    output_paths = build_output_paths(output_path, len(chunks))
+    for chunk, chunk_output_path in zip(chunks, output_paths):
+        write_epub(chunk_output_path, chunk.title, chunk.body)
     cache.save()
-    print(f"Rendered {input_path} -> {output_path}")
+    for chunk_output_path in output_paths:
+        print(f"Rendered {input_path} -> {chunk_output_path}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -713,11 +825,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     render_parser.add_argument("input", type=Path, help="Path to the source markdown file.")
     render_parser.add_argument("output", type=Path, nargs="?", help="Target HTML path.")
+    render_parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=DEFAULT_CHUNK_SIZE,
+        help="Approximate text units per output chunk. Chinese characters count as one unit.",
+    )
     render_parser.set_defaults(
         func=lambda args: run_render(
             args.input,
             args.output
-            or OUTPUT_DIR / f"{args.input.stem}.html",
+            or HTML_OUTPUT_DIR / f"{args.input.stem.lower()}.html",
+            args.chunk_size,
         )
     )
 
@@ -727,11 +846,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     epub_parser.add_argument("input", type=Path, help="Path to the source markdown file.")
     epub_parser.add_argument("output", type=Path, nargs="?", help="Target EPUB path.")
+    epub_parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=DEFAULT_CHUNK_SIZE,
+        help="Approximate text units per output chunk. Chinese characters count as one unit.",
+    )
     epub_parser.set_defaults(
         func=lambda args: run_render_epub(
             args.input,
             args.output
-            or OUTPUT_DIR / f"{args.input.stem}.epub",
+            or EPUB_OUTPUT_DIR / f"{args.input.stem.lower()}.epub",
+            args.chunk_size,
         )
     )
     return parser
