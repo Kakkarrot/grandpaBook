@@ -1,17 +1,19 @@
+"""Shared rendering pipeline for Chinese study-book outputs."""
+
 from __future__ import annotations
 
-import argparse
 import html
+import io
 import json
 import os
 import re
-import sys
+import tempfile
 import uuid
 import zipfile
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Iterable
 
 ROOT = Path(__file__).resolve().parent
 CACHE_DIR = ROOT / ".cache"
@@ -19,6 +21,7 @@ ARGOS_ROOT = CACHE_DIR / "argos"
 OUTPUT_DIR = ROOT / "output"
 HTML_OUTPUT_DIR = OUTPUT_DIR / "html"
 EPUB_OUTPUT_DIR = OUTPUT_DIR / "epub"
+PDF_OUTPUT_DIR = OUTPUT_DIR / "pdf"
 TRANSLATION_CACHE_PATH = CACHE_DIR / "sentence_translations.json"
 
 # Keep all Argos data inside the repo so the project is self-contained.
@@ -27,6 +30,8 @@ os.environ.setdefault("XDG_CACHE_HOME", str(ARGOS_ROOT / "cache"))
 os.environ.setdefault("XDG_CONFIG_HOME", str(ARGOS_ROOT / "config"))
 os.environ.setdefault("ARGOS_PACKAGES_DIR", str(ARGOS_ROOT / "packages"))
 os.environ.setdefault("ARGOS_BEAM_SIZE", "1")
+if (Path("/opt/homebrew/lib") / "libgobject-2.0.dylib").exists():
+    os.environ.setdefault("DYLD_LIBRARY_PATH", "/opt/homebrew/lib")
 
 try:
     import certifi  # type: ignore
@@ -47,6 +52,36 @@ CLOSING_QUOTES = set("”’」』）》】」』）)]}")
 LIST_ITEM_RE = re.compile(r"^\s*([-*+]|\d+\.)\s+")
 TEXT_UNIT_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]|[A-Za-z0-9]+")
 DEFAULT_CHUNK_SIZE = 5000
+PDF_MONOCHROME_CSS = """
+<style>
+  * {
+    color: #000 !important;
+  }
+
+  .pdf-ruby {
+    display: inline-block;
+    margin-right: 0.03em;
+    text-align: center;
+    vertical-align: baseline;
+    line-height: 1;
+  }
+
+  .pdf-ruby .pdf-rt {
+    display: block;
+    font-size: 0.5em;
+    line-height: 1;
+  }
+
+  .pdf-ruby .pdf-rb {
+    display: block;
+    line-height: 1.15;
+  }
+</style>
+"""
+RUBY_TAG_RE = re.compile(
+    r'<ruby class="hz"><rb>(.*?)</rb><rt>(.*?)</rt></ruby>',
+    re.DOTALL,
+)
 
 
 PAGE_TEMPLATE = """<!DOCTYPE html>
@@ -58,12 +93,12 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   <style>
     :root {{
       --page-width: 8.5in;
-      --text: #1e1a16;
-      --muted: #6d6256;
+      --text: #000;
+      --muted: #000;
       --paper: #fffdf8;
       --rule: #d8cebf;
-      --translation: #2a4b6b;
-      --accent: #8a4b12;
+      --translation: #000;
+      --accent: #000;
     }}
 
     @page {{
@@ -192,7 +227,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 EPUB_STYLES = """body {
   margin: 0;
   padding: 0 0.5em 1.2em;
-  color: #1e1a16;
+  color: #000;
   font-family: serif;
   line-height: 1.7;
 }
@@ -233,14 +268,14 @@ h1 {
 
 .english-line {
   margin-top: 0.2em;
-  color: #2a4b6b;
+  color: #000;
   font-size: 0.9em;
   font-style: italic;
 }
 
 ruby.hz rt {
   font-size: 0.55em;
-  color: #6d6256;
+  color: #000;
 }
 
 li {
@@ -300,6 +335,9 @@ class Block:
 class RenderChunk:
     title: str
     body: str
+
+
+ChunkWriter = Callable[[Path, str, str], None]
 
 
 class TranslationCache:
@@ -384,7 +422,7 @@ class SentenceTranslator:
         if from_lang is None or to_lang is None or from_lang.get_translation(to_lang) is None:
             raise RuntimeError(
                 "Chinese→English Argos package is not installed. "
-                "Run `venv/bin/python main.py setup-translate` first."
+                "Run `venv/bin/python setup_translate.py` first."
             )
 
         self._translation = from_lang.get_translation(to_lang)
@@ -684,8 +722,92 @@ def render_document_chunks(
     return rendered_chunks
 
 
+def prepare_document_chunks(markdown_text: str, chunk_size: int) -> tuple[str, list[list[Block]]]:
+    blocks = parse_blocks(markdown_text)
+    return extract_title(blocks), split_blocks_for_chunks(blocks, chunk_size)
+
+
 def render_html_page(title: str, body: str) -> str:
     return PAGE_TEMPLATE.format(title=html.escape(title), body=body)
+
+
+def force_monochrome_html(html_text: str) -> str:
+    if "</head>" in html_text:
+        return html_text.replace("</head>", f"{PDF_MONOCHROME_CSS}\n</head>", 1)
+    return f"{PDF_MONOCHROME_CSS}\n{html_text}"
+
+
+def make_html_pdf_compatible(html_text: str) -> str:
+    def replace_ruby(match: re.Match[str]) -> str:
+        rb = match.group(1)
+        rt = match.group(2)
+        return (
+            '<span class="pdf-ruby">'
+            f'<span class="pdf-rt">{rt}</span>'
+            f'<span class="pdf-rb">{rb}</span>'
+            "</span>"
+        )
+
+    return RUBY_TAG_RE.sub(replace_ruby, force_monochrome_html(html_text))
+
+
+def pdf_footer_label(output_path: Path) -> str:
+    stem = output_path.stem
+    if stem.startswith("chapter_"):
+        return f"Chapter {stem.removeprefix('chapter_')}"
+    return stem
+
+
+def add_pdf_page_numbers(input_path: Path, output_path: Path, footer_label: str) -> None:
+    try:
+        from pypdf import PdfReader, PdfWriter
+        from reportlab.pdfgen import canvas
+    except ImportError as exc:
+        raise RuntimeError(
+            "PDF page numbering requires pypdf and reportlab. "
+            "Install them with `venv/bin/pip install pypdf reportlab`."
+        ) from exc
+
+    reader = PdfReader(str(input_path))
+    writer = PdfWriter()
+
+    for index, page in enumerate(reader.pages, start=1):
+        width = float(page.mediabox.width)
+        height = float(page.mediabox.height)
+        packet = io.BytesIO()
+        overlay = canvas.Canvas(packet, pagesize=(width, height))
+        overlay.setFillColorRGB(0, 0, 0)
+        overlay.setFont("Times-Roman", 9)
+        footer = f"{footer_label} page {index}"
+        overlay.drawCentredString(width / 2, 24, footer)
+        overlay.save()
+
+        packet.seek(0)
+        overlay_page = PdfReader(packet).pages[0]
+        page.merge_page(overlay_page)
+        writer.add_page(page)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("wb") as output_file:
+        writer.write(output_file)
+
+
+def write_pdf_with_weasyprint(output_path: Path, title: str, body: str) -> None:
+    from weasyprint import HTML
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_html = make_html_pdf_compatible(render_html_page(title, body))
+    with tempfile.NamedTemporaryFile(
+        suffix=".pdf",
+        dir=output_path.parent,
+        delete=False,
+    ) as temp_file:
+        raw_pdf_path = Path(temp_file.name)
+    try:
+        HTML(string=output_html, base_url=str(ROOT)).write_pdf(raw_pdf_path)
+        add_pdf_page_numbers(raw_pdf_path, output_path, pdf_footer_label(output_path))
+    finally:
+        raw_pdf_path.unlink(missing_ok=True)
 
 
 def build_epub_opf(title: str, identifier: str) -> str:
@@ -734,6 +856,17 @@ def write_epub(output_path: Path, title: str, body: str) -> None:
         epub.writestr("OEBPS/styles/book.css", EPUB_STYLES)
 
 
+def write_pdf(output_path: Path, title: str, body: str) -> None:
+    try:
+        write_pdf_with_weasyprint(output_path, title, body)
+    except Exception as exc:
+        raise RuntimeError(
+            "PDF rendering requires WeasyPrint and its native system libraries. "
+            "Install Python deps with `venv/bin/pip install weasyprint pypdf reportlab`; "
+            "on macOS, install WeasyPrint's native libraries if this still fails."
+        ) from exc
+
+
 def build_output_paths(output_path: Path, total_chunks: int) -> list[Path]:
     if total_chunks == 1:
         return [output_path]
@@ -775,104 +908,118 @@ def run_setup_translate() -> None:
     print(f"Chinese→English translation package is ready in {ARGOS_ROOT}")
 
 
-def run_render(input_path: Path, output_path: Path, chunk_size: int = DEFAULT_CHUNK_SIZE) -> None:
+def log_progress(message: str) -> None:
+    print(message, flush=True)
+
+
+def render_chunks_to_outputs(
+    input_path: Path,
+    output_path: Path,
+    chunk_size: int,
+    *,
+    output_dir: Path,
+    writer: ChunkWriter,
+) -> None:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    HTML_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    log_progress(f"Loading {input_path}")
     cache = TranslationCache(TRANSLATION_CACHE_PATH)
     translator = SentenceTranslator()
     markdown_text = input_path.read_text(encoding="utf-8")
-    chunks = render_document_chunks(markdown_text, translator, cache, chunk_size)
-    output_paths = build_output_paths(output_path, len(chunks))
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    for chunk, chunk_output_path in zip(chunks, output_paths):
-        output_html = render_html_page(chunk.title, chunk.body)
-        chunk_output_path.write_text(output_html, encoding="utf-8")
+    base_title, block_chunks = prepare_document_chunks(markdown_text, chunk_size)
+    output_paths = build_output_paths(output_path, len(block_chunks))
+
+    log_progress(f"Prepared {len(block_chunks)} chunk(s) with chunk size {chunk_size}")
+    for index, (chunk_blocks, chunk_output_path) in enumerate(zip(block_chunks, output_paths), start=1):
+        chunk_title = base_title if len(block_chunks) == 1 else f"{base_title} Part {index}"
+        log_progress(f"[{index}/{len(block_chunks)}] Rendering {chunk_title}")
+        body = render_blocks(chunk_blocks, translator, cache)
+        log_progress(f"[{index}/{len(block_chunks)}] Writing {chunk_output_path}")
+        writer(chunk_output_path, chunk_title, body)
+        log_progress(f"[{index}/{len(block_chunks)}] Done {chunk_output_path}")
+
+    log_progress(f"Saving translation cache to {TRANSLATION_CACHE_PATH}")
     cache.save()
-    for chunk_output_path in output_paths:
-        print(f"Rendered {input_path} -> {chunk_output_path}")
+    log_progress(f"Rendered {input_path} -> {len(output_paths)} file(s)")
+
+
+def write_html(output_path: Path, title: str, body: str) -> None:
+    output_path.write_text(render_html_page(title, body), encoding="utf-8")
+
+
+def run_render_html(input_path: Path, output_path: Path, chunk_size: int = DEFAULT_CHUNK_SIZE) -> None:
+    render_chunks_to_outputs(
+        input_path,
+        output_path,
+        chunk_size,
+        output_dir=HTML_OUTPUT_DIR,
+        writer=write_html,
+    )
 
 
 def run_render_epub(input_path: Path, output_path: Path, chunk_size: int = DEFAULT_CHUNK_SIZE) -> None:
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    EPUB_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    cache = TranslationCache(TRANSLATION_CACHE_PATH)
-    translator = SentenceTranslator()
-    markdown_text = input_path.read_text(encoding="utf-8")
-    chunks = render_document_chunks(markdown_text, translator, cache, chunk_size)
-    output_paths = build_output_paths(output_path, len(chunks))
-    for chunk, chunk_output_path in zip(chunks, output_paths):
-        write_epub(chunk_output_path, chunk.title, chunk.body)
-    cache.save()
-    for chunk_output_path in output_paths:
-        print(f"Rendered {input_path} -> {chunk_output_path}")
-
-
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Render a Chinese markdown chapter into print-friendly HTML with pinyin and English."
+    render_chunks_to_outputs(
+        input_path,
+        output_path,
+        chunk_size,
+        output_dir=EPUB_OUTPUT_DIR,
+        writer=write_epub,
     )
-    subparsers = parser.add_subparsers(dest="command", required=True)
 
-    setup_parser = subparsers.add_parser(
-        "setup-translate",
-        help="Download and install the offline Chinese→English Argos model into this repo.",
-    )
-    setup_parser.set_defaults(func=lambda args: run_setup_translate())
 
-    render_parser = subparsers.add_parser(
-        "render",
-        help="Convert a markdown chapter into HTML with pinyin and English translation.",
+def run_render_pdf(input_path: Path, output_path: Path, chunk_size: int = DEFAULT_CHUNK_SIZE) -> None:
+    render_chunks_to_outputs(
+        input_path,
+        output_path,
+        chunk_size,
+        output_dir=PDF_OUTPUT_DIR,
+        writer=write_pdf,
     )
-    render_parser.add_argument("input", type=Path, help="Path to the source markdown file.")
-    render_parser.add_argument("output", type=Path, nargs="?", help="Target HTML path.")
-    render_parser.add_argument(
+
+
+def run_output_cli(
+    argv: Iterable[str] | None,
+    *,
+    description: str,
+    default_output_dir: Path,
+    default_suffix: str,
+    runner: Callable[[Path, Path, int], None],
+) -> int:
+    import argparse
+    import sys
+
+    parser = argparse.ArgumentParser(description=description)
+    parser.add_argument("input", type=Path, help="Path to the source markdown file.")
+    parser.add_argument("output", type=Path, nargs="?", help=f"Target {default_suffix.upper()} path.")
+    parser.add_argument(
         "--chunk-size",
         type=int,
         default=DEFAULT_CHUNK_SIZE,
         help="Approximate text units per output chunk. Chinese characters count as one unit.",
     )
-    render_parser.set_defaults(
-        func=lambda args: run_render(
-            args.input,
-            args.output
-            or HTML_OUTPUT_DIR / f"{args.input.stem.lower()}.html",
-            args.chunk_size,
-        )
-    )
-
-    epub_parser = subparsers.add_parser(
-        "render-epub",
-        help="Convert a markdown chapter into EPUB with pinyin and English translation.",
-    )
-    epub_parser.add_argument("input", type=Path, help="Path to the source markdown file.")
-    epub_parser.add_argument("output", type=Path, nargs="?", help="Target EPUB path.")
-    epub_parser.add_argument(
-        "--chunk-size",
-        type=int,
-        default=DEFAULT_CHUNK_SIZE,
-        help="Approximate text units per output chunk. Chinese characters count as one unit.",
-    )
-    epub_parser.set_defaults(
-        func=lambda args: run_render_epub(
-            args.input,
-            args.output
-            or EPUB_OUTPUT_DIR / f"{args.input.stem.lower()}.epub",
-            args.chunk_size,
-        )
-    )
-    return parser
-
-
-def main(argv: Iterable[str] | None = None) -> int:
-    parser = build_parser()
     args = parser.parse_args(argv)
+    output_path = args.output or default_output_dir / f"{args.input.stem.lower()}.{default_suffix}"
     try:
-        args.func(args)
+        runner(args.input, output_path, args.chunk_size)
     except Exception as exc:  # pragma: no cover - CLI surface
         print(f"Error: {exc}", file=sys.stderr)
         return 1
     return 0
 
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+def run_setup_cli(argv: Iterable[str] | None = None) -> int:
+    import argparse
+    import sys
+
+    parser = argparse.ArgumentParser(
+        description="Download and install the offline Chinese-to-English Argos model into this repo."
+    )
+    parser.parse_args(argv)
+    try:
+        run_setup_translate()
+    except Exception as exc:  # pragma: no cover - CLI surface
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    return 0
